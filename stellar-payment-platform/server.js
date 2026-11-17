@@ -104,15 +104,16 @@ const swaggerOptions = {
   },
   apis: ["./server.js", "./src/routes/v1/*.js"],
 };
-const swaggerSpec = swaggerJsdoc(swaggerOptions);
-app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
-
-// #31 — Attach a correlation ID to every request before anything else runs so
-// all downstream middleware, handlers and logs can reference the same trace.
+// #31 — Attach a correlation ID and security headers to every request before
+// any route handler (including documentation routes) runs so every response
+// carries Content-Security-Policy and hardening headers.
 app.use(correlationId);
-app.use(pinoHttp({ logger, autoLogging: false })); // Use autoLogging: false if you want custom logs, or true if you want everything. PR says "Logs incoming HTTP requests", so let's enable it (default is true).
+app.use(pinoHttp({ logger, autoLogging: false }));
 app.disable("x-powered-by");
 app.use(securityMiddleware);
+
+const swaggerSpec = swaggerJsdoc(swaggerOptions);
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
 app.use(timeout("10s"));
 app.use((err, req, res, next) => {

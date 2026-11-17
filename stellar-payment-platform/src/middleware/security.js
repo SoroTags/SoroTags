@@ -29,6 +29,7 @@ const cspDirectives = {
   scriptSrc: ["'none'"],
   styleSrc: ["'none'"],
   imgSrc: ["'none'"],
+  connectSrc: ["'none'"],
   fontSrc: ["'none'"],
   objectSrc: ["'none'"],
   mediaSrc: ["'none'"],
@@ -37,10 +38,18 @@ const cspDirectives = {
   formAction: ["'none'"],
 };
 
+/**
+ * Restrictive Content-Security-Policy middleware for API-only responses.
+ * `useDefaults: false` prevents Helmet from merging permissive HTML defaults
+ * so `default-src 'none'` and explicit `'none'` directives govern every route.
+ */
+const contentSecurityPolicy = helmet.contentSecurityPolicy({
+  useDefaults: false,
+  directives: cspDirectives,
+});
+
 const helmetMiddleware = helmet({
-  contentSecurityPolicy: {
-    directives: cspDirectives,
-  },
+  contentSecurityPolicy: false,
   frameguard: {
     action: 'deny',
   },
@@ -69,10 +78,15 @@ const permissionsPolicy = (_req, res, next) => {
 };
 
 /**
- * Combined security middleware: Helmet hardening + Permissions-Policy.
- * Mount this once at the top of the middleware stack.
+ * Combined security middleware: Helmet hardening + strict CSP + Permissions-Policy.
+ * Mount this once at the top of the middleware stack so every API response
+ * carries `Content-Security-Policy: default-src 'none'; ...`.
  */
-const securityMiddleware = [helmetMiddleware, permissionsPolicy];
+const securityMiddleware = [
+  helmetMiddleware,
+  contentSecurityPolicy,
+  permissionsPolicy,
+];
 
 // ---------------------------------------------------------------------------
 // Tiered rate limiting
@@ -213,6 +227,7 @@ const rateLimiter = createRateLimiter();
 
 module.exports = {
   securityMiddleware,
+  contentSecurityPolicy,
   cspDirectives,
   permissionsPolicy,
   createRateLimiter,

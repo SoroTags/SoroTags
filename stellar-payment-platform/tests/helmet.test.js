@@ -48,6 +48,10 @@ jest.mock('../src/routes/v1/authRoutes', () => () => {
 global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
 
 const { app } = require('../server');
+const {
+  contentSecurityPolicy,
+  cspDirectives,
+} = require('../src/middleware/security');
 
 describe('Helmet Security Headers', () => {
   it('should remove the X-Powered-By header', async () => {
@@ -70,11 +74,38 @@ describe('Helmet Security Headers', () => {
     expect(response.header).toHaveProperty('content-security-policy');
     const csp = response.header['content-security-policy'];
     expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("connect-src 'none'");
     expect(csp).toContain("frame-ancestors 'none'");
     expect(csp).toContain("object-src 'none'");
     expect(csp).toContain("script-src 'none'");
     expect(csp).toContain("style-src 'none'");
+    expect(csp).toContain("base-uri 'none'");
     expect(csp).toContain("form-action 'none'");
+    expect(csp).not.toContain('unsafe-inline');
+    expect(csp).not.toContain('upgrade-insecure-requests');
+  });
+
+  it('should include Content-Security-Policy with default-src none across JSON, text, 404, and error responses', async () => {
+    const paths = [
+      '/api/v1/time',
+      '/.well-known/stellar.toml',
+      '/.well-known/jwks.json',
+      '/nonexistent-api-endpoint',
+    ];
+
+    for (const path of paths) {
+      const response = await request(app).get(path);
+      expect(response.header).toHaveProperty('content-security-policy');
+      expect(response.header['content-security-policy']).toContain(
+        "default-src 'none'",
+      );
+    }
+  });
+
+  it('should export helmet.contentSecurityPolicy middleware and strict directives from security.js', () => {
+    expect(typeof contentSecurityPolicy).toBe('function');
+    expect(cspDirectives.defaultSrc).toEqual(["'none'"]);
+    expect(cspDirectives.frameAncestors).toEqual(["'none'"]);
   });
 
   it('should set Permissions-Policy disabling camera, microphone, and geolocation', async () => {
