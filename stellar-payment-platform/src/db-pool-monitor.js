@@ -26,8 +26,11 @@ const WARN_THRESHOLD =
 const CHECK_INTERVAL_MS =
   parseInt(process.env.DB_POOL_CHECK_INTERVAL_MS, 10) || 30_000;
 
-/** Tracks whether metrics were unavailable on the first check (logged once). */
+/** Tracks whether metrics were unavailable during getPoolMetrics (logged once). */
 let metricsUnavailableLogged = false;
+
+/** Tracks whether metrics were unavailable during startup probe (logged once). */
+let probeUnavailableLogged = false;
 
 /**
  * Gauge indicating whether Prisma pool monitoring is available (1) or not (0).
@@ -68,8 +71,10 @@ function probeMetricsAvailability(prisma) {
 
   setDbPoolMonitoringAvailable(available ? 1 : 0);
 
-  if (!available && !metricsUnavailableLogged) {
-    metricsUnavailableLogged = true;
+  if (available) {
+    probeUnavailableLogged = false;
+  } else if (!probeUnavailableLogged) {
+    probeUnavailableLogged = true;
     logger.warn(
       '[db-pool-monitor] Prisma metrics unavailable — ensure the "metrics" ' +
         'preview feature is enabled in schema.prisma and the client has been regenerated. ' +
@@ -94,16 +99,21 @@ async function getPoolMetrics(prisma) {
   try {
     const { gauges = [] } = await prisma.$metrics.json();
 
-    const find = (key) => {
-      const entry = gauges.find((m) => m.key === key);
-      return typeof entry?.value === 'number' ? entry.value : 0;
+    const find = (...keys) => {
+      for (const key of keys) {
+        const entry = gauges.find((m) => m.key === key);
+        if (typeof entry?.value === 'number') {
+          return entry.value;
+        }
+      }
+      return 0;
     };
 
     return {
-      active: find('prisma_pool_connections_busy'),
-      idle: find('prisma_pool_connections_idle'),
-      size: find('prisma_pool_connections_open'),
-      waiters: find('prisma_client_queries_wait'),
+      active: find('prisma_pool_connections_busy', 'db_pool_connections_busy'),
+      idle: find('prisma_pool_connections_idle', 'db_pool_connections_idle'),
+      size: find('prisma_pool_connections_open', 'db_pool_connections_open'),
+      waiters: find('prisma_client_queries_wait', 'db_pool_queries_waiting'),
     };
   } catch {
     // $metrics is unavailable (preview feature not enabled, or older Prisma).
@@ -116,6 +126,32 @@ async function getPoolMetrics(prisma) {
     }
     return null;
   }
+}
+
+/**
+ * Returns pool saturation metrics keyed by monitor gauge names so `/health`
+ * can inspect `db_pool_queries_waiting` and `db_pool_connections_busy`.
+ *
+ * @param {import('@prisma/client').PrismaClient} prisma
+ * @returns {Promise<{
+ *   db_pool_queries_waiting: number,
+ *   db_pool_connections_busy: number,
+ *   db_pool_connections_idle: number,
+ *   db_pool_connections_open: number,
+ * } | null>}
+ */
+async function getPoolHealthMetrics(prisma) {
+  const snapshot = await module.exports.getPoolMetrics(prisma);
+  if (!snapshot) {
+    return null;
+  }
+
+  return {
+    db_pool_queries_waiting: snapshot.waiters,
+    db_pool_connections_busy: snapshot.active,
+    db_pool_connections_idle: snapshot.idle,
+    db_pool_connections_open: snapshot.size,
+  };
 }
 
 /**
@@ -220,6 +256,7 @@ function schedulePoolMonitoring(prisma) {
 module.exports = {
   schedulePoolMonitoring,
   getPoolMetrics,
+  getPoolHealthMetrics,
   checkPool,
   probeMetricsAvailability,
   getDbPoolMonitoringAvailable,

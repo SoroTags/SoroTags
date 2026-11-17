@@ -6,10 +6,14 @@ jest.mock('@stellar/stellar-sdk', () => ({
 }));
 
 jest.mock('../prismaClient', () => ({
-  prisma: { $queryRaw: jest.fn() },
+  prisma: {
+    $queryRaw: jest.fn(),
+    $metrics: { json: jest.fn() },
+  },
 }));
 
 const { prisma } = require('../prismaClient');
+const poolMonitor = require('../src/db-pool-monitor');
 const { HORIZON_BASE } = require('../src/services/stellarService');
 const healthRoutes = require('../src/routes/v1/healthRoutes');
 
@@ -24,13 +28,26 @@ let redisClient;
 beforeEach(() => {
   jest.clearAllMocks();
   prisma.$queryRaw.mockResolvedValue([{ 1: 1 }]);
+  prisma.$metrics.json.mockResolvedValue({
+    counters: [],
+    histograms: [],
+    gauges: [
+      { key: 'prisma_pool_connections_busy', value: 2, labels: {} },
+      { key: 'prisma_pool_connections_idle', value: 8, labels: {} },
+      { key: 'prisma_pool_connections_open', value: 10, labels: {} },
+      { key: 'prisma_client_queries_wait', value: 0, labels: {} },
+    ],
+  });
   redisClient = { ping: jest.fn().mockResolvedValue('PONG') };
   global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
   delete process.env.HEALTH_HORIZON_TIMEOUT_MS;
+  delete process.env.POOL_WARN_THRESHOLD;
 });
 
 afterEach(() => {
   delete process.env.HEALTH_HORIZON_TIMEOUT_MS;
+  delete process.env.POOL_WARN_THRESHOLD;
+  jest.restoreAllMocks();
 });
 
 describe('GET /health', () => {
@@ -267,5 +284,109 @@ describe('GET /health — X-Correlation-ID header', () => {
 
     expect(res.status).toBe(503);
     expect(res.headers['x-correlation-id']).toBe(myId);
+  });
+});
+
+describe('GET /health — database connection pool saturation', () => {
+  test('includes pool metrics in healthy 200 response while preserving database field', async () => {
+    const res = await request(buildApp(redisClient)).get('/health');
+
+    expect(res.status).toBe(200);
+    expect(res.body.database).toBe('up');
+    expect(res.body.pool).toEqual({
+      status: 'healthy',
+      waitingQueries: 0,
+      busyConnections: 2,
+    });
+  });
+
+  test('returns 503 when waitingQueries exceeds POOL_WARN_THRESHOLD even if SELECT 1 succeeds', async () => {
+    jest.spyOn(poolMonitor, 'getPoolHealthMetrics').mockResolvedValue({
+      db_pool_queries_waiting: 8,
+      db_pool_connections_busy: 10,
+      db_pool_connections_idle: 0,
+      db_pool_connections_open: 10,
+    });
+
+    const res = await request(buildApp(redisClient)).get('/health');
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('DOWN');
+    expect(res.body.database).toBe('up');
+    expect(res.body.pool).toEqual({
+      status: 'saturated',
+      waitingQueries: 8,
+      busyConnections: 10,
+    });
+    expect(res.body.message).toContain('Database connection pool saturated');
+  });
+
+  test('supports POOL_WARN_THRESHOLD=0 to always surface pool data and flag any queued query', async () => {
+    process.env.POOL_WARN_THRESHOLD = '0';
+
+    prisma.$metrics.json.mockResolvedValueOnce({
+      counters: [],
+      histograms: [],
+      gauges: [
+        { key: 'prisma_pool_connections_busy', value: 4, labels: {} },
+        { key: 'prisma_pool_connections_idle', value: 6, labels: {} },
+        { key: 'prisma_pool_connections_open', value: 10, labels: {} },
+        { key: 'prisma_client_queries_wait', value: 0, labels: {} },
+      ],
+    });
+
+    const okRes = await request(buildApp(redisClient)).get('/health');
+    expect(okRes.status).toBe(200);
+    expect(okRes.body.pool).toEqual({
+      status: 'healthy',
+      waitingQueries: 0,
+      busyConnections: 4,
+    });
+
+    prisma.$metrics.json.mockResolvedValueOnce({
+      counters: [],
+      histograms: [],
+      gauges: [
+        { key: 'prisma_pool_connections_busy', value: 10, labels: {} },
+        { key: 'prisma_pool_connections_idle', value: 0, labels: {} },
+        { key: 'prisma_pool_connections_open', value: 10, labels: {} },
+        { key: 'prisma_client_queries_wait', value: 1, labels: {} },
+      ],
+    });
+
+    const satRes = await request(buildApp(redisClient)).get('/health');
+    expect(satRes.status).toBe(503);
+    expect(satRes.body.status).toBe('DOWN');
+    expect(satRes.body.database).toBe('up');
+    expect(satRes.body.pool).toEqual({
+      status: 'saturated',
+      waitingQueries: 1,
+      busyConnections: 10,
+    });
+  });
+
+  test('respects custom POOL_WARN_THRESHOLD and falls back gracefully when metrics are unavailable', async () => {
+    process.env.POOL_WARN_THRESHOLD = '2';
+
+    jest.spyOn(poolMonitor, 'getPoolHealthMetrics').mockResolvedValueOnce({
+      db_pool_queries_waiting: 2,
+      db_pool_connections_busy: 9,
+      db_pool_connections_idle: 1,
+      db_pool_connections_open: 10,
+    });
+
+    const atThreshold = await request(buildApp(redisClient)).get('/health');
+    expect(atThreshold.status).toBe(200);
+    expect(atThreshold.body.pool.status).toBe('healthy');
+
+    jest.spyOn(poolMonitor, 'getPoolHealthMetrics').mockResolvedValueOnce(null);
+
+    const noMetrics = await request(buildApp(redisClient)).get('/health');
+    expect(noMetrics.status).toBe(200);
+    expect(noMetrics.body.pool).toEqual({
+      status: 'healthy',
+      waitingQueries: 0,
+      busyConnections: 0,
+    });
   });
 });
