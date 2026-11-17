@@ -9,6 +9,8 @@
 const ERROR_CODES = {
   INVALID_INPUT: 400,
   UNAUTHENTICATED: 401,
+  TOKEN_EXPIRED: 401,
+  TOKEN_INVALID: 401,
   FORBIDDEN: 403,
   NOT_FOUND: 404,
   METHOD_NOT_ALLOWED: 405,
@@ -29,6 +31,8 @@ const ERROR_CODES = {
 const DEFAULT_MESSAGES = {
   INVALID_INPUT: 'Invalid request',
   UNAUTHENTICATED: 'Authentication required',
+  TOKEN_EXPIRED: 'Your session has expired. Please log in again.',
+  TOKEN_INVALID: 'Invalid or malformed authentication token.',
   FORBIDDEN: 'Forbidden',
   NOT_FOUND: 'Not Found',
   METHOD_NOT_ALLOWED: 'Method Not Allowed',

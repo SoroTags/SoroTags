@@ -263,9 +263,43 @@
         }
       },
       "Unauthorized": {
-        "description": "Authentication required",
+        "description": "Authentication failed due to a missing header (`UNAUTHENTICATED`), an expired JWT (`TOKEN_EXPIRED`), or a malformed/tampered JWT (`TOKEN_INVALID`).",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/AuthErrorResponse" },
+            "examples": {
+              "tokenExpired": {
+                "summary": "Expired JWT session",
+                "value": {
+                  "success": false,
+                  "error": {
+                    "code": "TOKEN_EXPIRED",
+                    "message": "Your session has expired. Please log in again."
+                  }
+                }
+              },
+              "tokenInvalid": {
+                "summary": "Malformed or tampered JWT",
+                "value": {
+                  "success": false,
+                  "error": {
+                    "code": "TOKEN_INVALID",
+                    "message": "Invalid or malformed authentication token."
+                  }
+                }
+              },
+              "unauthenticated": {
+                "summary": "Missing Authorization header",
+                "value": {
+                  "success": false,
+                  "error": {
+                    "code": "UNAUTHENTICATED",
+                    "message": "Authentication required"
+                  }
+                }
+              }
+            }
+          }
         }
       },
       "Forbidden": {
@@ -355,6 +389,33 @@
           "error": { "type": "string" },
           "message": { "type": "string" },
           "details": { "type": "object" }
+        }
+      },
+      "AuthErrorResponse": {
+        "type": "object",
+        "required": ["success", "error"],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [false]
+          },
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": ["TOKEN_EXPIRED", "TOKEN_INVALID", "UNAUTHENTICATED"],
+                "description": "Machine-readable authentication failure code distinguishing expired sessions from invalid or missing tokens."
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          },
+          "correlation_id": {
+            "type": "string"
+          }
         }
       }
     }
