@@ -242,6 +242,9 @@ pub enum Error {
     AmountBelowMinimum = 15,
 }
 
+/// Alias matching the standard `ContractError` naming convention.
+pub type ContractError = Error;
+
 /// Soroban contract that routes token payments between addresses while
 /// collecting a configurable platform fee, enforcing per-user daily spending
 /// limits, and supporting an admin-managed blacklist and pause switch.
@@ -347,6 +350,14 @@ impl PaymentRouter {
         env.storage()
             .instance()
             .get(&DataKey::Frozen)
+            .unwrap_or(false)
+    }
+
+    /// Returns whether the contract is currently paused.
+    fn is_paused_internal(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
             .unwrap_or(false)
     }
 
@@ -981,9 +992,7 @@ impl PaymentRouter {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        env.storage()
-            .instance()
-            .set(&DataKey::MinAmount, &amount);
+        env.storage().instance().set(&DataKey::MinAmount, &amount);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -1046,6 +1055,53 @@ impl PaymentRouter {
         Self::set_pause(env, paused)
     }
 
+    /// Halts all payment routing immediately as an emergency circuit breaker. Admin-only.
+    ///
+    /// Sets `paused` (`DataKey::Paused`) to `true` in contract storage and emits
+    /// a `contract_paused` event. Subsequent `route_payment` and `route_payments`
+    /// calls return `ContractError::Paused` until `unpause` is called.
+    pub fn pause(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_paused"), admin),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Contract paused by admin");
+        Ok(())
+    }
+
+    /// Clears the paused circuit breaker and restores payment routing. Admin-only.
+    ///
+    /// Sets `paused` (`DataKey::Paused`) to `false` in contract storage and emits
+    /// a `contract_unpaused` event.
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_unpaused"), admin),
+            env.ledger().timestamp(),
+        );
+
+        log!(&env, "Contract unpaused by admin");
+        Ok(())
+    }
+
     /// Returns whether the contract is currently paused.
     ///
     /// # Returns
@@ -1054,10 +1110,7 @@ impl PaymentRouter {
     /// # Panics
     /// Does not panic.
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+        Self::is_paused_internal(&env)
     }
 
     /// Returns the cumulative amount a given sender has routed through the contract.
@@ -1285,10 +1338,10 @@ impl PaymentRouter {
         amount: i128,
     ) -> Result<(), Error> {
         if Self::is_frozen_internal(&env) {
-            return Err(Error::ContractFrozen);
+            return Err(ContractError::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
+        if Self::is_paused_internal(&env) {
+            return Err(ContractError::Paused);
         }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
@@ -1323,10 +1376,10 @@ impl PaymentRouter {
     /// a token transfer to `platform_treasury` fails.
     pub fn route_payments(env: Env, payments: Vec<Payment>) -> Result<(), Error> {
         if Self::is_frozen_internal(&env) {
-            return Err(Error::ContractFrozen);
+            return Err(ContractError::ContractFrozen);
         }
-        if Self::is_paused(env.clone()) {
-            return Err(Error::Paused);
+        if Self::is_paused_internal(&env) {
+            return Err(ContractError::Paused);
         }
 
         let (platform_treasury, fee_bps, fee_cap) = Self::load_fee_config(&env)?;
@@ -1526,11 +1579,13 @@ impl PaymentRouter {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Events, Ledger as _, LedgerInfo},
+        testutils::{Address as _, Events, Ledger as _, LedgerInfo, MockAuth, MockAuthInvoke},
         token::StellarAssetClient,
-        Address, Env, Symbol, TryIntoVal,
+        Address, Env, IntoVal, Symbol, TryIntoVal,
     };
 
     /// Returns (env, client, contract_id).
@@ -1960,6 +2015,221 @@ mod test {
         assert_eq!(topics.len(), 1);
         let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
         assert_eq!(topic, symbol_short!("pause"));
+    }
+
+    #[test]
+    fn test_pause_unpause_circuit_breaker_cycle() {
+        let (env, client, _) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+        assert!(!client.is_paused());
+
+        // 1. Pause contract and verify contract_paused event + paused flag
+        client.pause();
+        assert!(client.is_paused());
+
+        let pause_events = env.events().all();
+        let paused_event_found = pause_events.iter().any(|(_, topics, _)| {
+            if topics.len() < 2 {
+                return false;
+            }
+            let sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            let evt_admin: Result<Address, _> = topics.get(1).unwrap().try_into_val(&env);
+            sym == Ok(Symbol::new(&env, "contract_paused")) && evt_admin == Ok(admin.clone())
+        });
+        assert!(paused_event_found, "contract_paused event not found");
+
+        // 2. Attempt single and batch route while paused -> ContractError::Paused
+        let route_err = client.try_route_payment(&sender, &recipient, &token_address, &1_000);
+        assert_eq!(route_err, Err(Ok(ContractError::Paused)));
+
+        let batch = soroban_sdk::vec![
+            &env,
+            Payment {
+                sender: sender.clone(),
+                recipient: recipient.clone(),
+                token_address: token_address.clone(),
+                amount: 1_000,
+            },
+        ];
+        let batch_err = client.try_route_payments(&batch);
+        assert_eq!(batch_err, Err(Ok(ContractError::Paused)));
+
+        // Balances must remain untouched while paused
+        assert_eq!(token_client.balance(&sender), 10_000);
+        assert_eq!(token_client.balance(&recipient), 0);
+        assert_eq!(token_client.balance(&treasury), 0);
+
+        // 3. Unpause contract and verify contract_unpaused event + paused flag cleared
+        client.unpause();
+        assert!(!client.is_paused());
+
+        let unpause_events = env.events().all();
+        let unpaused_event_found = unpause_events.iter().any(|(_, topics, _)| {
+            if topics.len() < 2 {
+                return false;
+            }
+            let sym: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            let evt_admin: Result<Address, _> = topics.get(1).unwrap().try_into_val(&env);
+            sym == Ok(Symbol::new(&env, "contract_unpaused")) && evt_admin == Ok(admin.clone())
+        });
+        assert!(unpaused_event_found, "contract_unpaused event not found");
+
+        // 4. Route payment succeeds after unpause (100 bps of 1_000 = 10 fee, 990 remainder)
+        client.route_payment(&sender, &recipient, &token_address, &1_000);
+        assert_eq!(token_client.balance(&sender), 9_000);
+        assert_eq!(token_client.balance(&treasury), 10);
+        assert_eq!(token_client.balance(&recipient), 990);
+    }
+
+    #[test]
+    fn test_pause_and_unpause_require_admin_auth() {
+        let (env, client, _contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+
+        client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+        // Verify pause() gates strictly on the admin address via recorded auths
+        client.pause();
+        let pause_auths = env.auths();
+        assert_eq!(pause_auths.len(), 1);
+        assert_eq!(pause_auths[0].0, admin);
+        assert_ne!(pause_auths[0].0, non_admin);
+        assert!(client.is_paused());
+
+        // Verify unpause() gates strictly on the admin address via recorded auths
+        client.unpause();
+        let unpause_auths = env.auths();
+        assert_eq!(unpause_auths.len(), 1);
+        assert_eq!(unpause_auths[0].0, admin);
+        assert_ne!(unpause_auths[0].0, non_admin);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn test_non_admin_cannot_pause() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: (
+                    admin.clone(),
+                    treasury.clone(),
+                    100i128,
+                    1_000i128,
+                    PaymentRouter::MAX_AMOUNT,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        PaymentRouterClient::new(&env, &contract_id).initialize(
+            &admin,
+            &treasury,
+            &100,
+            &1_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        // Authorize only non_admin: calling pause must trap with Auth InvalidAction
+        env.mock_auths(&[MockAuth {
+            address: &non_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "pause",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        env.as_contract(&contract_id, || {
+            let _ = PaymentRouter::pause(env.clone());
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn test_non_admin_cannot_unpause() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PaymentRouter);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: (
+                    admin.clone(),
+                    treasury.clone(),
+                    100i128,
+                    1_000i128,
+                    PaymentRouter::MAX_AMOUNT,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        PaymentRouterClient::new(&env, &contract_id).initialize(
+            &admin,
+            &treasury,
+            &100,
+            &1_000,
+            &PaymentRouter::MAX_AMOUNT,
+        );
+
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "pause",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        PaymentRouterClient::new(&env, &contract_id).pause();
+        assert!(PaymentRouterClient::new(&env, &contract_id).is_paused());
+
+        // Authorize only non_admin: calling unpause must trap with Auth InvalidAction
+        env.mock_auths(&[MockAuth {
+            address: &non_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "unpause",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        env.as_contract(&contract_id, || {
+            let _ = PaymentRouter::unpause(env.clone());
+        });
+    }
+
+    #[test]
+    fn test_pause_and_unpause_before_initialize_return_not_initialized() {
+        let (_env, client, _) = setup_env();
+        assert_eq!(client.try_pause(), Err(Ok(ContractError::NotInitialized)));
+        assert_eq!(client.try_unpause(), Err(Ok(ContractError::NotInitialized)));
     }
 
     #[test]
@@ -2692,7 +2962,10 @@ mod test {
         assert_eq!(token_client.balance(&contract_id), remainder);
 
         // Sender's refund ledger must reflect the full remainder.
-        assert_eq!(client.get_refund_balance(&sender, &token_address), remainder);
+        assert_eq!(
+            client.get_refund_balance(&sender, &token_address),
+            remainder
+        );
 
         // A "refunded" event must have been published.
         let events = env.events().all();
@@ -2707,7 +2980,10 @@ mod test {
             };
             t0 == symbol_short!("refunded")
         });
-        assert!(refunded_found, "route_payment should publish a \"refunded\" event on trustline failure");
+        assert!(
+            refunded_found,
+            "route_payment should publish a \"refunded\" event on trustline failure"
+        );
     }
 
     #[test]
@@ -2899,8 +3175,12 @@ mod test {
         let version_str = std::str::from_utf8(&bytes).expect("version should be valid UTF-8");
 
         // Must have exactly two dots (MAJOR.MINOR.PATCH).
-        let parts: Vec<&str> = version_str.split('.').collect();
-        assert_eq!(parts.len(), 3, "version must have three components, got: {version_str}");
+        let parts: std::vec::Vec<&str> = version_str.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "version must have three components, got: {version_str}"
+        );
 
         // Each part must be a non-negative integer.
         for part in &parts {
