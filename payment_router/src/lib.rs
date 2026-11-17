@@ -1,4 +1,7 @@
 #![no_std]
+#[cfg(test)]
+extern crate std;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, BytesN,
     Env, Symbol, Vec,
@@ -325,6 +328,25 @@ impl PaymentRouter {
         env.storage().persistent().get(&key).unwrap_or(0)
     }
 
+    /// Checks whether `recipient` has an active, authorized trustline for
+    /// `token_address` before attempting a transfer:
+    /// 1. `token_client.try_balance(recipient)` returns `Err` on Stellar Asset
+    ///    Contracts when a classic Stellar account has no trustline entry, while
+    ///    returning `Ok(Ok(_))` on valid SEP-41 tokens and trusted accounts.
+    /// 2. `sac_client.try_authorized(recipient)` returns `Ok(Ok(false))` when a
+    ///    trustline or contract balance is deauthorized.
+    fn has_recipient_trustline(env: &Env, token_address: &Address, recipient: &Address) -> bool {
+        let token_client = token::Client::new(env, token_address);
+        if !matches!(token_client.try_balance(recipient), Ok(Ok(_))) {
+            return false;
+        }
+        let sac_client = token::StellarAssetClient::new(env, token_address);
+        match sac_client.try_authorized(recipient) {
+            Ok(Ok(authorized)) => authorized,
+            _ => true,
+        }
+    }
+
     fn credit_refund_balance(env: &Env, user: &Address, token: &Address, amount: i128) {
         let key = DataKey::RefundBalance(user.clone(), token.clone());
         let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -494,21 +516,27 @@ impl PaymentRouter {
             token_client.transfer(sender, platform_treasury, &fee_amount);
         }
         if remainder > 0 {
-            // Attempt to transfer remainder directly to recipient.
-            // If recipient cannot receive tokens (e.g. missing trustline or rejection),
+            // Validate recipient trustline before attempting transfer.
+            // If recipient lacks an authorized trustline or rejects the transfer,
             // transfer funds into the contract and credit the sender's internal refund ledger.
-            match token_client.try_transfer(sender, recipient, &remainder) {
-                Ok(Ok(())) => {
-                    log!(env, "Remaining balance routed to recipient");
-                }
-                _ => {
-                    log!(
-                        env,
-                        "Recipient transfer failed; crediting sender refund balance"
-                    );
-                    token_client.transfer(sender, &env.current_contract_address(), &remainder);
-                    Self::credit_refund_balance(env, sender, token_address, remainder);
-                }
+            let transferred = if Self::has_recipient_trustline(env, token_address, recipient) {
+                matches!(
+                    token_client.try_transfer(sender, recipient, &remainder),
+                    Ok(Ok(()))
+                )
+            } else {
+                false
+            };
+
+            if transferred {
+                log!(env, "Remaining balance routed to recipient");
+            } else {
+                log!(
+                    env,
+                    "Recipient missing trustline or transfer failed; crediting sender refund balance"
+                );
+                token_client.transfer(sender, &env.current_contract_address(), &remainder);
+                Self::credit_refund_balance(env, sender, token_address, remainder);
             }
         }
 
@@ -981,9 +1009,7 @@ impl PaymentRouter {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
 
-        env.storage()
-            .instance()
-            .set(&DataKey::MinAmount, &amount);
+        env.storage().instance().set(&DataKey::MinAmount, &amount);
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
             Self::INSTANCE_BUMP_AMOUNT,
@@ -2651,10 +2677,11 @@ mod test {
         );
     }
 
-    /// When a recipient has no trustline (deauthorized on a Stellar Asset
-    /// Contract), `route_payment` must NOT abort.  Instead it should credit
-    /// the sender's refund ledger with the remainder and emit a "refunded"
-    /// event so the sender can later call `withdraw_refund`.
+    /// When a classic Stellar account recipient has not established a trustline
+    /// on a Stellar Asset Contract, `route_payment` must NOT abort. Instead it
+    /// checks the trustline before transfer, credits the sender's refund ledger
+    /// with the remainder, and emits a "refunded" event so the sender can later
+    /// call `withdraw_refund`.
     #[test]
     fn test_route_payment_credits_refund_on_missing_trustline() {
         let (env, client, contract_id) = setup_env();
@@ -2662,7 +2689,10 @@ mod test {
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
+        let recipient = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GARFMBNMMBP34IGQBARST2KQOY7NL7XEHPWAM43C2WUMV4725B5VBUBX",
+        ));
 
         let (token_address, token_client, stellar_asset_client) = setup_token(&env);
 
@@ -2674,8 +2704,11 @@ mod test {
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
         client.add_supported_token(&token_address);
 
-        // Deauthorize the recipient's trustline so any transfer to them fails.
-        stellar_asset_client.set_authorized(&recipient, &false);
+        // Trustline check helper must detect the missing trustline.
+        let has_trustline = env.as_contract(&contract_id, || {
+            PaymentRouter::has_recipient_trustline(&env, &token_address, &recipient)
+        });
+        assert!(!has_trustline);
 
         // route_payment must succeed (not abort).
         let amount = 2_000i128;
@@ -2684,30 +2717,89 @@ mod test {
         // Fee (1 % of 2000 = 20) still reaches the treasury.
         assert_eq!(token_client.balance(&treasury), 20);
 
-        // Recipient received nothing — trustline was deauthorized.
-        assert_eq!(token_client.balance(&recipient), 0);
+        // Recipient received nothing — trustline entry is missing.
+        assert!(token_client.try_balance(&recipient).is_err());
 
         // Remainder (1980) must be held by the contract.
         let remainder = 1_980i128;
         assert_eq!(token_client.balance(&contract_id), remainder);
 
         // Sender's refund ledger must reflect the full remainder.
-        assert_eq!(client.get_refund_balance(&sender, &token_address), remainder);
+        assert_eq!(
+            client.get_refund_balance(&sender, &token_address),
+            remainder
+        );
 
-        // A "refunded" event must have been published.
+        // A "refunded" event must have been published with (sender, token_address) -> remainder.
         let events = env.events().all();
         let refunded_found = events.iter().any(|evt| {
-            let (_cid, topics, _data) = evt;
-            if topics.len() < 1 {
+            let (_cid, topics, data) = evt;
+            if topics.len() != 3 {
                 return false;
             }
             let t0: soroban_sdk::Symbol = match topics.get(0).unwrap().try_into_val(&env) {
                 Ok(s) => s,
                 Err(_) => return false,
             };
-            t0 == symbol_short!("refunded")
+            if t0 != symbol_short!("refunded") {
+                return false;
+            }
+            let ev_sender: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            let ev_token: Address = topics.get(2).unwrap().try_into_val(&env).unwrap();
+            let ev_amount: i128 = data.try_into_val(&env).unwrap();
+            ev_sender == sender && ev_token == token_address && ev_amount == remainder
         });
-        assert!(refunded_found, "route_payment should publish a \"refunded\" event on trustline failure");
+        assert!(
+            refunded_found,
+            "route_payment should publish a \"refunded\" event on trustline failure"
+        );
+    }
+
+    #[test]
+    fn test_route_payments_batch_credits_refund_on_missing_trustline() {
+        let (env, client, contract_id) = setup_env();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender_1 = Address::generate(&env);
+        let sender_2 = Address::generate(&env);
+        let valid_recipient = Address::generate(&env);
+        let untrusted_recipient = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GCX35AFCKVKHUCKWOZNAH7S36WFFZYLAQRT3LZUGV3JIYNFVTENMGH4W",
+        ));
+
+        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
+        stellar_asset_client.mint(&sender_1, &10_000i128);
+        stellar_asset_client.mint(&sender_2, &10_000i128);
+
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let mut batch = Vec::new(&env);
+        batch.push_back(Payment {
+            sender: sender_1.clone(),
+            recipient: valid_recipient.clone(),
+            token_address: token_address.clone(),
+            amount: 1_000,
+        });
+        batch.push_back(Payment {
+            sender: sender_2.clone(),
+            recipient: untrusted_recipient.clone(),
+            token_address: token_address.clone(),
+            amount: 2_000,
+        });
+
+        client.route_payments(&batch);
+
+        // Fees: 10 + 20 = 30
+        assert_eq!(token_client.balance(&treasury), 30);
+        // Valid recipient receives 990
+        assert_eq!(token_client.balance(&valid_recipient), 990);
+        // Untrusted recipient has no trustline; contract holds 1980 in sender_2's refund ledger
+        assert!(token_client.try_balance(&untrusted_recipient).is_err());
+        assert_eq!(token_client.balance(&contract_id), 1_980);
+        assert_eq!(client.get_refund_balance(&sender_1, &token_address), 0);
+        assert_eq!(client.get_refund_balance(&sender_2, &token_address), 1_980);
     }
 
     #[test]
@@ -2899,8 +2991,12 @@ mod test {
         let version_str = std::str::from_utf8(&bytes).expect("version should be valid UTF-8");
 
         // Must have exactly two dots (MAJOR.MINOR.PATCH).
-        let parts: Vec<&str> = version_str.split('.').collect();
-        assert_eq!(parts.len(), 3, "version must have three components, got: {version_str}");
+        let parts: std::vec::Vec<&str> = version_str.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "version must have three components, got: {version_str}"
+        );
 
         // Each part must be a non-negative integer.
         for part in &parts {
