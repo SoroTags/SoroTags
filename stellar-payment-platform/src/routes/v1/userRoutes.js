@@ -178,6 +178,16 @@ router.post(
       );
     }
 
+    if (!StrKey.isValidEd25519PublicKey(address)) {
+      return next(
+        new ApiError(
+          "INVALID_INPUT",
+          "Invalid Stellar Public Key format for 'address': please provide a valid Stellar address.",
+          { details: [{ field: "address", message: "Invalid Stellar address" }] },
+        ),
+      );
+    }
+
     const BLOCKED_EXCHANGES = [
       "GA5XIGA5C7QTPTWXQYYUGCGQFBLOUZLYVVKXUHZHZWBYEAIELE4KZTOG",
       "GCO2IP3VKXUNOHURKEHCDFWNOSECYIMA5QLGNTKVVHESURVDMBWGIGLO",
@@ -203,12 +213,6 @@ router.post(
           "Username must be at least 3 characters long.",
         ),
       );
-    }
-
-    if (!StrKey.isValidEd25519PublicKey(address)) {
-      const error = new Error("Invalid Stellar Public Key format.");
-      error.statusCode = 400;
-      return next(error);
     }
 
     const memoError = validateMemo(memoType, memo);
@@ -295,6 +299,19 @@ router.post(
         },
         req,
       });
+
+      const locationDomain =
+        process.env.STELLAR_TAG_DOMAIN ||
+        req.get("host") ||
+        process.env.DOMAIN ||
+        "localhost";
+      const locationLocalPart = normalizedUsername.includes("*")
+        ? normalizedUsername.split("*")[0]
+        : normalizedUsername;
+      res.set(
+        "Location",
+        `/federation?q=${locationLocalPart}*${locationDomain}`,
+      );
 
       return res.status(201).json({
         ok: true,

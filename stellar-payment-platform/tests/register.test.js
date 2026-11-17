@@ -12,19 +12,55 @@
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
-jest.mock('@stellar/stellar-sdk', () => ({
-  Horizon: {
-    Server: jest.fn().mockImplementation(() => ({ payments: jest.fn() })),
-  },
-  StrKey: {
-    isValidEd25519PublicKey: jest.fn(
-      (v) => typeof v === 'string' && v.startsWith('G'),
-    ),
-  },
-  Keypair: {
-    fromPublicKey: jest.fn(() => ({ verify: jest.fn(() => true) })),
-  },
-}));
+jest.mock('@stellar/stellar-sdk', () => {
+  function crc16Xmodem(buf) {
+    let crc = 0x0000;
+    for (let i = 0; i < buf.length; i += 1) {
+      let code = ((crc >>> 8) & 0xff) ^ (buf[i] & 0xff);
+      code ^= code >>> 4;
+      crc = ((crc << 8) ^ (code << 12) ^ (code << 5) ^ code) & 0xffff;
+    }
+    return crc;
+  }
+
+  function isValidStellarPublicKey(value) {
+    if (typeof value !== 'string' || value.length !== 56 || value !== value.toUpperCase()) {
+      return false;
+    }
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    let bits = 0;
+    let acc = 0;
+    const bytes = [];
+    for (let i = 0; i < value.length; i += 1) {
+      const idx = alphabet.indexOf(value[i]);
+      if (idx === -1) return false;
+      acc = (acc << 5) | idx;
+      bits += 5;
+      if (bits >= 8) {
+        bits -= 8;
+        bytes.push((acc >>> bits) & 0xff);
+      }
+    }
+    if (bytes.length !== 35 || (acc & ((1 << bits) - 1)) !== 0) return false;
+    if (bytes[0] !== 48) return false;
+    const payload = Buffer.from(bytes.slice(0, 33));
+    const expectedChecksum = crc16Xmodem(payload);
+    const actualChecksum = bytes[33] | (bytes[34] << 8);
+    return expectedChecksum === actualChecksum;
+  }
+
+  return {
+    Horizon: {
+      Server: jest.fn().mockImplementation(() => ({ payments: jest.fn() })),
+    },
+    StrKey: {
+      isValidEd25519PublicKey: jest.fn((v) => isValidStellarPublicKey(v)),
+    },
+    Keypair: {
+      fromPublicKey: jest.fn(() => ({ verify: jest.fn(() => true) })),
+    },
+  };
+});
 
 // Mock verifyMultiSignerThreshold to always succeed so tests focus on is_primary
 // logic rather than Horizon connectivity.
@@ -102,8 +138,9 @@ const { app } = require('../server');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const VALID_ADDRESS = 'GABC123456789012345678901234567890123456789012345678';
-const VALID_ADDRESS_2 = 'GDEF123456789012345678901234567890123456789012345678';
+const VALID_ADDRESS = 'GARFMBNMMBP34IGQBARST2KQOY7NL7XEHPWAM43C2WUMV4725B5VBUBX';
+const VALID_ADDRESS_2 = 'GCX35AFCKVKHUCKWOZNAH7S36WFFZYLAQRT3LZUGV3JIYNFVTENMGH4W';
+const BAD_CHECKSUM_ADDRESS = 'GARFMBNMMBP34IGQBARST2KQOY7NL7XEHPWAM43C2WUMV4725B5VBUBA';
 
 function makeRegisterPayload(overrides = {}) {
   return {
@@ -343,6 +380,76 @@ describe('POST /api/v1/register — validation and conflict handling', () => {
       is_primary: expect.any(Boolean),
       federation_address: expect.stringContaining('alice123'),
     });
+  });
+
+  it('returns 400 INVALID_INPUT referencing address when POST /register receives "BADKEY"', async () => {
+    const res = await request(app)
+      .post('/register')
+      .set('Content-Type', 'application/json')
+      .send({ username: 'alice123', address: 'BADKEY' });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({
+      success: false,
+      error: {
+        code: 'INVALID_INPUT',
+      },
+    });
+    expect(res.body.error.message).toMatch(/address/i);
+    expect(mockCount).not.toHaveBeenCalled();
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 INVALID_INPUT referencing address when POST /api/v1/register receives "BADKEY"', async () => {
+    const res = await request(app)
+      .post('/api/v1/register')
+      .set('Content-Type', 'application/json')
+      .send({ username: 'alice123', address: 'BADKEY' });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({
+      success: false,
+      error: {
+        code: 'INVALID_INPUT',
+      },
+    });
+    expect(res.body.error.message).toMatch(/address/i);
+    expect(mockCount).not.toHaveBeenCalled();
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it('rejects a 56-character G... address with an invalid StrKey checksum before any DB operation', async () => {
+    for (const endpoint of ['/register', '/api/v1/register']) {
+      const res = await request(app)
+        .post(endpoint)
+        .set('Content-Type', 'application/json')
+        .send({ username: 'alice123', address: BAD_CHECKSUM_ADDRESS });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('INVALID_INPUT');
+      expect(res.body.error.message).toMatch(/address/i);
+    }
+    expect(mockCount).not.toHaveBeenCalled();
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it('accepts a valid checksummed G... key on POST /register', async () => {
+    mockCount.mockResolvedValue(0);
+    mockCreate.mockResolvedValue({
+      username: 'alice123*localhost',
+      address: VALID_ADDRESS_2,
+      isPrimary: true,
+    });
+
+    const res = await request(app)
+      .post('/register')
+      .set('Content-Type', 'application/json')
+      .send({ username: 'alice123', address: VALID_ADDRESS_2 });
+
+    expect(res.status).toBe(201);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.address).toBe(VALID_ADDRESS_2);
+    expect(mockCreate).toHaveBeenCalledTimes(1);
   });
 });
 

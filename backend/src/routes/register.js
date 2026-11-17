@@ -16,7 +16,11 @@ router.post('/register', rejectNestedObjects, async (req, res, next) => {
     }
 
     if (!StrKey.isValidEd25519PublicKey(address)) {
-      throw new ApiError('INVALID_INPUT', 'Invalid Stellar address');
+      throw new ApiError(
+        'INVALID_INPUT',
+        "Invalid Stellar Public Key format for 'address': please provide a valid Stellar address.",
+        { details: [{ field: 'address', message: 'Invalid Stellar address' }] },
+      );
     }
 
     const existing = await prisma.account.findUnique({ where: { address } });

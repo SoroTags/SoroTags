@@ -828,6 +828,16 @@ app.post(
       );
     }
 
+    if (!StrKey.isValidEd25519PublicKey(address)) {
+      return next(
+        new ApiError(
+          "INVALID_INPUT",
+          "Invalid Stellar Public Key format for 'address': please provide a valid Stellar address.",
+          { details: [{ field: "address", message: "Invalid Stellar address" }] },
+        ),
+      );
+    }
+
     // Extract the username part before the * for the profanity check
     const usernameLocalPart = username.includes("*")
       ? username.split("*")[0]
@@ -838,12 +848,6 @@ app.post(
       return next(
         new ApiError("INVALID_INPUT", "Username contains restricted words"),
       );
-    }
-
-    if (!StrKey.isValidEd25519PublicKey(address)) {
-      const error = new Error("Invalid Stellar Public Key format.");
-      error.statusCode = 400;
-      return next(error);
     }
 
     const memoError = validateMemo(memoType, memo);
