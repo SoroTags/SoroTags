@@ -253,15 +253,27 @@ describe('enforceMigrationPolicy', () => {
 
   const base = { policy: 'warn', pending: false, drift: false, skipped: false, output: '' };
 
-  it('exits in strict mode when migrations are pending', () => {
+  it('exits in strict mode when migrations are pending and logs pending migration files', () => {
     const { shouldExit } = enforceMigrationPolicy({
       ...base,
       policy: 'strict',
       status: 'pending',
       pending: true,
+      pendingMigrations: ['20260727120000_add_deleted_at', '20260801000000_add_webhooks'],
     });
     expect(shouldExit).toBe(true);
-    expect(mockLogger.error).toHaveBeenCalledWith(expect.stringContaining('out of sync'));
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.stringContaining('out of sync'),
+    );
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.stringContaining('Pending migration files:'),
+    );
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.stringContaining('20260727120000_add_deleted_at'),
+    );
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.stringContaining('20260801000000_add_webhooks'),
+    );
   });
 
   it('exits in strict mode when drift is detected', () => {
@@ -303,22 +315,53 @@ describe('enforceMigrationPolicy', () => {
     expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining('Could not determine'));
   });
 });
+describe('extractPendingMigrations', () => {
+  let extractPendingMigrations;
+
+  beforeAll(() => {
+    ({ extractPendingMigrations } = require('../src/migrate-check'));
+  });
+
+  it('extracts bulleted and plain pending migration names from Prisma CLI output', () => {
+    const output = [
+      'Following migration(s) have not yet been applied:',
+      '- 20260101_add_col',
+      '20260215120000_add_users_index',
+      '',
+      'To apply migrations in development run prisma migrate dev.',
+    ].join('\n');
+
+    expect(extractPendingMigrations(output)).toEqual([
+      '20260101_add_col',
+      '20260215120000_add_users_index',
+    ]);
+  });
+
+  it('returns an empty array when schema is up to date or output is empty', () => {
+    expect(extractPendingMigrations('Status: Database schema is up to date!')).toEqual([]);
+    expect(extractPendingMigrations('')).toEqual([]);
+  });
+});
+
 describe('strict-mode process.exit integration', () => {
-  let checkMigrations;
-  let enforceMigrationPolicy;
+  let verifyMigrationsOrExit;
 
   beforeEach(() => {
     jest.clearAllMocks();
     jest.resetModules();
-    ({ checkMigrations, enforceMigrationPolicy } = require('../src/migrate-check'));
+    ({ verifyMigrationsOrExit } = require('../src/migrate-check'));
   });
 
-  it('calls process.exit(1) before any port is bound when strict mode has pending migrations', async () => {
-    // Simulate pending migrations output from prisma CLI.
+  afterEach(() => {
+    delete process.env.MIGRATION_POLICY;
+    delete process.env.DATABASE_URL;
+  });
+
+  it('calls process.exit(1) before any port is bound and logs pending migration files when strict mode has pending migrations', async () => {
     mockExecFile.mockImplementation((_bin, _args, _opts, cb) => {
       cb(
         Object.assign(new Error('pending'), { code: 1 }),
-        'Following migration(s) have not yet been applied:\n- 20260101_add_col',
+        'Following migration(s) have not yet been applied:\n- 20260101_add_col\n- 20260202_add_memo_idx',
         '',
       );
     });
@@ -329,26 +372,29 @@ describe('strict-mode process.exit integration', () => {
     const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
     const listenSpy = jest.fn();
 
-    // Run the migration check as the server startup sequence does.
-    const result = await checkMigrations();
-    const { shouldExit } = enforceMigrationPolicy(result);
-
-    if (shouldExit) {
-      await mockLogger.flush();
-      process.exit(1);
-    } else {
+    const { ok, result } = await verifyMigrationsOrExit();
+    if (ok) {
       listenSpy();
     }
 
+    expect(ok).toBe(false);
+    expect(result.pendingMigrations).toEqual([
+      '20260101_add_col',
+      '20260202_add_memo_idx',
+    ]);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
     expect(exitSpy).toHaveBeenCalledWith(1);
     expect(listenSpy).not.toHaveBeenCalled();
 
+    const loggedErrors = mockLogger.error.mock.calls.map((args) => args.join(' ')).join('\n');
+    expect(loggedErrors).toContain('20260101_add_col');
+    expect(loggedErrors).toContain('20260202_add_memo_idx');
+    expect(loggedErrors).toContain('migration.sql');
+
     exitSpy.mockRestore();
-    delete process.env.DATABASE_URL;
   });
 
-  it('exits with code 1 when strict mode detects drift', async () => {
-    // Simulate drift output from the prisma CLI.
+  it('exits with code 1 before port binding when strict mode detects drift', async () => {
     mockExecFile.mockImplementation((_bin, _args, _opts, cb) => {
       cb(
         Object.assign(new Error('drift'), { code: 1 }),
@@ -363,31 +409,25 @@ describe('strict-mode process.exit integration', () => {
     const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
     const listenSpy = jest.fn();
 
-    const result = await checkMigrations();
+    const { ok, result } = await verifyMigrationsOrExit();
+    if (ok) {
+      listenSpy();
+    }
+
+    expect(ok).toBe(false);
     expect(result.status).toBe('drift');
     expect(result.drift).toBe(true);
-
-    const { shouldExit } = enforceMigrationPolicy(result);
-
-    if (shouldExit) {
-      await mockLogger.flush();
-      process.exit(1);
-    } else {
-      listenSpy();
-    }
-
     expect(exitSpy).toHaveBeenCalledWith(1);
     expect(listenSpy).not.toHaveBeenCalled();
 
     exitSpy.mockRestore();
-    delete process.env.DATABASE_URL;
   });
 
-  it('flushes the logger before process.exit so the error is visible', async () => {
+  it('flushes the logger before process.exit(1) so the error is visible', async () => {
     mockExecFile.mockImplementation((_bin, _args, _opts, cb) => {
       cb(
-        Object.assign(new Error('drift'), { code: 1 }),
-        'following migration(s) differ from the migrations recorded in the database',
+        Object.assign(new Error('pending'), { code: 1 }),
+        'Following migration(s) have not yet been applied:\n- 20260303_add_audit',
         '',
       );
     });
@@ -403,19 +443,49 @@ describe('strict-mode process.exit integration', () => {
       callOrder.push('exit');
     });
 
-    const result = await checkMigrations();
-    const { shouldExit } = enforceMigrationPolicy(result);
-
-    if (shouldExit) {
-      await mockLogger.flush();
-      process.exit(1);
-    }
+    await verifyMigrationsOrExit();
 
     expect(mockLogger.flush).toHaveBeenCalled();
     expect(callOrder).toEqual(['flush', 'exit']);
 
     exitSpy.mockRestore();
-    delete process.env.DATABASE_URL;
+  });
+
+  it('keeps warn and off behaviors intact without calling process.exit', async () => {
+    mockExecFile.mockImplementation((_bin, _args, _opts, cb) => {
+      cb(
+        Object.assign(new Error('pending'), { code: 1 }),
+        'Following migration(s) have not yet been applied:\n- 20260404_add_tags',
+        '',
+      );
+    });
+
+    process.env.DATABASE_URL = 'postgresql://localhost/test';
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    const listenSpy = jest.fn();
+
+    process.env.MIGRATION_POLICY = 'warn';
+    const warnGate = await verifyMigrationsOrExit();
+    if (warnGate.ok) listenSpy();
+
+    expect(warnGate.ok).toBe(true);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('20260404_add_tags'),
+    );
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(listenSpy).toHaveBeenCalledTimes(1);
+
+    mockExecFile.mockClear();
+    process.env.MIGRATION_POLICY = 'off';
+    const offGate = await verifyMigrationsOrExit();
+    if (offGate.ok) listenSpy();
+
+    expect(offGate.ok).toBe(true);
+    expect(mockExecFile).not.toHaveBeenCalled();
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(listenSpy).toHaveBeenCalledTimes(2);
+
+    exitSpy.mockRestore();
   });
 
   it('does not call process.exit when strict mode and migrations are up to date', async () => {
@@ -429,21 +499,16 @@ describe('strict-mode process.exit integration', () => {
     const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
     const listenSpy = jest.fn();
 
-    const result = await checkMigrations();
-    const { shouldExit } = enforceMigrationPolicy(result);
-
-    if (shouldExit) {
-      await mockLogger.flush();
-      process.exit(1);
-    } else {
+    const { ok } = await verifyMigrationsOrExit();
+    if (ok) {
       listenSpy();
     }
 
+    expect(ok).toBe(true);
     expect(exitSpy).not.toHaveBeenCalled();
     expect(mockLogger.flush).not.toHaveBeenCalled();
     expect(listenSpy).toHaveBeenCalled();
 
     exitSpy.mockRestore();
-    delete process.env.DATABASE_URL;
   });
 });

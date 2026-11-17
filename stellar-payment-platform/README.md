@@ -60,17 +60,17 @@ When the feature is enabled, `db_pool_monitoring_available` is set to `1` and th
 
 ## Migrations
 
-The application can run a migration drift check at startup, controlled by the `MIGRATION_POLICY` environment variable.
+The application runs a migration status check (`src/migrate-check.js`) during startup before binding any HTTP port, controlled by the `MIGRATION_POLICY` environment variable.
 
 ### `MIGRATION_POLICY`
 
-| Value    | Behaviour                                                                 |
-| -------- | ------------------------------------------------------------------------- |
-| `off`    | Skip the drift check entirely.                                            |
-| `warn`   | Log a warning if drift is detected, but continue startup.                 |
-| `strict` | Log an error and exit the process with code `1` if drift is detected.     |
+| Value    | Behaviour                                                                                                                               |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `off`    | Skip the startup migration check entirely.                                                                                              |
+| `warn`   | Log a warning naming any pending migration files or schema drift, and continue startup (default).                                       |
+| `strict` | Log an error naming the pending migration files (or schema drift), flush logs, and exit with code `1` before `app.listen()` binds a port. |
 
-Under `MIGRATION_POLICY=strict`, when drift is detected the migration check flushes all log buffers **before** calling `process.exit(1)`. This ensures the error is written to disk and visible in the logs even in environments such as PM2 or Docker with `restart: always`, where the process may otherwise be restarted before the log line is flushed. The exit code is propagated through `startup.sh` so that Docker health checks and orchestrators can observe the failure.
+Under `MIGRATION_POLICY=strict`, when pending migrations or schema drift are detected, `verifyMigrationsOrExit()` logs the unapplied migration file paths, flushes all log buffers, and calls `process.exit(1)` **before** `app.listen()` is invoked. This guarantees no port is bound against an unmigrated database and ensures the error is written to disk even in environments such as PM2 or Docker with `restart: always`. The exit code is also propagated through `startup.sh` so that Docker health checks and orchestrators can observe the failure.
 
 ## Configuration
 

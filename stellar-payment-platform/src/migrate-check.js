@@ -86,20 +86,98 @@ function runMigrateStatus() {
 }
 
 /**
+ * Extracts pending migration names or file paths from `prisma migrate status`
+ * output so startup error logs explicitly list unapplied migration files.
+ *
+ * @param {string} output
+ * @returns {string[]}
+ */
+function extractPendingMigrations(output) {
+  if (!output || typeof output !== 'string') {
+    return [];
+  }
+
+  const lines = output.split(/\r?\n/);
+  const found = [];
+  const seen = new Set();
+  let inPendingSection = false;
+
+  const addMigration = (candidate) => {
+    const cleaned = candidate
+      .replace(/^[-*]\s*/, '')
+      .replace(/^(?:prisma\/migrations\/|migrations\/)/i, '')
+      .trim();
+    if (!cleaned || seen.has(cleaned)) return;
+    seen.add(cleaned);
+    found.push(cleaned);
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      if (inPendingSection && found.length > 0) {
+        inPendingSection = false;
+      }
+      continue;
+    }
+
+    if (/\bnot (?:yet )?been applied:?|\bnot applied:?/i.test(line)) {
+      inPendingSection = true;
+      continue;
+    }
+
+    if (inPendingSection) {
+      if (/^(?:to apply|run |prisma schema|datasource|error:|warning:)/i.test(line)) {
+        inPendingSection = false;
+        continue;
+      }
+      const stripped = line.replace(/^[-*]\s*/, '').trim();
+      if (/^(?:(?:prisma\/)?migrations\/)?[A-Za-z0-9_.-]+(?:\/migration\.sql)?$/.test(stripped)) {
+        addMigration(stripped);
+        continue;
+      }
+    }
+
+    const tokenMatch = line.match(
+      /\b((?:(?:prisma\/)?migrations\/)?\d{8,}_[A-Za-z0-9_-]+(?:\/migration\.sql)?)\b/,
+    );
+    if (tokenMatch) {
+      addMigration(tokenMatch[1]);
+    }
+  }
+
+  return found;
+}
+
+/**
+ * Formats a migration identifier into an explicit migration file reference.
+ *
+ * @param {string} entry
+ * @returns {string}
+ */
+function formatPendingMigrationFile(entry) {
+  if (entry.endsWith('.sql')) {
+    return entry;
+  }
+  return `${entry} (prisma/migrations/${entry}/migration.sql)`;
+}
+
+/**
  * Classifies the raw `prisma migrate status` output into a machine-readable
  * result. Matching is deliberately lenient because wording differs across
  * Prisma CLI versions.
  * @param {{ code: number, output: string }} raw
- * @returns {{ status: string, pending: boolean, drift: boolean, output: string }}
+ * @returns {{ status: string, pending: boolean, drift: boolean, pendingMigrations: string[], output: string }}
  */
 function classifyStatus({ code, output }) {
   const text = (output || '').toLowerCase();
   const has = (...needles) => needles.some((needle) => text.includes(needle));
 
-  const result = (status, pending, drift) => ({
+  const result = (status, pending, drift, pendingMigrations = []) => ({
     status,
     pending,
     drift,
+    pendingMigrations,
     output,
   });
 
@@ -110,7 +188,7 @@ function classifyStatus({ code, output }) {
   // Match flexibly because wording varies across versions, e.g.
   // "not yet been applied", "have not yet been applied", "not been applied".
   if (/\bnot (?:yet )?been applied\b/.test(text) || has('not applied')) {
-    return result('pending', true, false);
+    return result('pending', true, false, extractPendingMigrations(output));
   }
   // The DB has been changed in a way the local migrations don't record
   // (drift), or the DB has migrations not present in the local folder.
@@ -140,6 +218,7 @@ function classifyStatus({ code, output }) {
  *   status: string,
  *   pending: boolean,
  *   drift: boolean,
+ *   pendingMigrations: string[],
  *   skipped: boolean,
  *   output: string,
  * }>}
@@ -148,7 +227,15 @@ async function checkMigrations() {
   const policy = currentPolicy();
 
   if (policy === 'off') {
-    return { policy, status: 'skipped', pending: false, drift: false, skipped: true, output: '' };
+    return {
+      policy,
+      status: 'skipped',
+      pending: false,
+      drift: false,
+      pendingMigrations: [],
+      skipped: true,
+      output: '',
+    };
   }
 
   if (!process.env.DATABASE_URL) {
@@ -157,7 +244,15 @@ async function checkMigrations() {
     logger.warn(
       '[migrate-check] DATABASE_URL is not set — skipping migration status check'
     );
-    return { policy, status: 'skipped', pending: false, drift: false, skipped: true, output: '' };
+    return {
+      policy,
+      status: 'skipped',
+      pending: false,
+      drift: false,
+      pendingMigrations: [],
+      skipped: true,
+      output: '',
+    };
   }
 
   let raw;
@@ -167,7 +262,15 @@ async function checkMigrations() {
     // The CLI itself failed to spawn (missing binary, EACCES...). Do not block
     // startup but surface it so operators can investigate.
     logger.warn(err, '[migrate-check] Could not run "prisma migrate status" — skipping check');
-    return { policy, status: 'error', pending: false, drift: false, skipped: true, output: err.message };
+    return {
+      policy,
+      status: 'error',
+      pending: false,
+      drift: false,
+      pendingMigrations: [],
+      skipped: true,
+      output: err.message,
+    };
   }
 
   return { policy, ...classifyStatus(raw), skipped: false };
@@ -181,6 +284,9 @@ async function checkMigrations() {
  */
 function enforceMigrationPolicy(result) {
   const { policy, status, pending, skipped, output } = result;
+  const pendingMigrations = Array.isArray(result.pendingMigrations)
+    ? result.pendingMigrations
+    : extractPendingMigrations(output);
 
   if (skipped) {
     return { shouldExit: false };
@@ -197,9 +303,18 @@ function enforceMigrationPolicy(result) {
     const reason = pending
       ? 'there are pending migrations that have not been applied'
       : 'the database schema has drifted from the local migrations';
+    const pendingFilesLines =
+      pending && pendingMigrations.length > 0
+        ? [
+            `Pending migration files: ${pendingMigrations
+              .map(formatPendingMigrationFile)
+              .join(', ')}`,
+          ]
+        : [];
     const message = [
       '[migrate-check] Database schema is out of sync with Prisma migrations.',
       `Cause: ${reason}.`,
+      ...pendingFilesLines,
       '',
       'Queries are likely to fail with cryptic Prisma errors (P2010 / P2021 / no such column).',
       'Run "npx prisma migrate deploy" (production/CI) or "npx prisma migrate dev" (development)',
@@ -289,9 +404,54 @@ function flushLogs() {
   });
 }
 
+/**
+ * Runs the startup migration check and exits with code 1 (after flushing
+ * buffered logs) before any port is bound when `MIGRATION_POLICY=strict`
+ * encounters pending migrations or schema drift.
+ *
+ * Returns `{ ok: false, result }` after `process.exit(1)` so callers never
+ * proceed to `app.listen()` even when `process.exit` is stubbed in tests.
+ *
+ * @returns {Promise<{ ok: boolean, result: object | null }>}
+ */
+async function verifyMigrationsOrExit() {
+  try {
+    const result = await checkMigrations();
+    const { shouldExit } = enforceMigrationPolicy(result);
+    if (shouldExit) {
+      const filesDetail =
+        result.pending &&
+        Array.isArray(result.pendingMigrations) &&
+        result.pendingMigrations.length > 0
+          ? ` Pending migration files: ${result.pendingMigrations
+              .map(formatPendingMigrationFile)
+              .join(', ')}.`
+          : '';
+      logger.error(
+        '[migrate-check] Aborting startup before port binding: ' +
+          `database migrations are not applied.${filesDetail}`
+      );
+      await flushLogs();
+      process.exit(1);
+      return { ok: false, result };
+    }
+    return { ok: true, result };
+  } catch (err) {
+    logger.error(
+      err,
+      '[migrate-check] Failed to verify migration status at startup.'
+    );
+    await flushLogs();
+    process.exit(1);
+    return { ok: false, result: null };
+  }
+}
+
 module.exports = {
   checkMigrations,
   enforceMigrationPolicy,
+  verifyMigrationsOrExit,
+  extractPendingMigrations,
   currentPolicy,
   classifyStatus,
   runMigrateStatus,

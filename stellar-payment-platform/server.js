@@ -1456,60 +1456,53 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
   });
 };
 
-if (require.main === module) {
-  const {
-    checkMigrations,
-    enforceMigrationPolicy,
-  } = require("./src/migrate-check");
+const startServer = () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    logger.info(`Server successfully initialized on port ${PORT}`);
+  });
 
-  const startServer = () => {
-    const server = app.listen(PORT, "0.0.0.0", () => {
-      logger.info(`Server successfully initialized on port ${PORT}`);
-    });
-
-    server.on("error", (e) => {
-      if (e.code === "EADDRINUSE") {
-        logger.error(
-          e,
-          `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`,
-        );
-        process.exit(1);
-      }
-    });
-
-    process.on("SIGTERM", (sig) =>
-      gracefulShutdown(server, prisma, sig, redisClient),
-    );
-    process.on("SIGINT", (sig) =>
-      gracefulShutdown(server, prisma, sig, redisClient),
-    );
-  };
-
-  // Verify the database is not out of sync with the Prisma migrations before
-  // binding a port, so schema drift surfaces as a clear startup error instead
-  // of a cryptic failure on the first query. In strict mode this exits
-  // (non-zero) when migrations are pending; in permissive mode it warns and
-  // continues. The server only boots once the result is known.
-  checkMigrations()
-    .then((result) => {
-      const { shouldExit } = enforceMigrationPolicy(result);
-      if (shouldExit) {
-        logger.error(
-          "[migrate-check] Aborting startup: database migrations are not applied.",
-        );
-        process.exit(1);
-      }
-      startServer();
-    })
-    .catch((err) => {
-      // Unexpected failure running the check itself — refuse to start deceptively
-      // healthy when we couldn't validate schema parity.
+  server.on("error", (e) => {
+    if (e.code === "EADDRINUSE") {
       logger.error(
-        err,
-        "[migrate-check] Failed to verify migration status at startup.",
+        e,
+        `Port ${PORT} is in use, forcing shutdown so Railway can restart cleanly.`,
       );
       process.exit(1);
-    });
+    }
+  });
+
+  process.on("SIGTERM", (sig) =>
+    gracefulShutdown(server, prisma, sig, redisClient),
+  );
+  process.on("SIGINT", (sig) =>
+    gracefulShutdown(server, prisma, sig, redisClient),
+  );
+
+  return server;
+};
+
+// Verify the database is not out of sync with the Prisma migrations before
+// binding a port, so schema drift or pending migrations surface as a clear
+// startup error instead of failing on the first query. In strict mode this
+// flushes logs and exits with code 1 before app.listen(); in warn/off modes it
+// proceeds normally.
+const bootstrapServer = async (listenFn = startServer) => {
+  const { verifyMigrationsOrExit } = require("./src/migrate-check");
+  const { ok } = await verifyMigrationsOrExit();
+  if (!ok) {
+    return null;
+  }
+  return listenFn();
+};
+
+if (require.main === module) {
+  bootstrapServer();
 }
 
-module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
+module.exports = {
+  app,
+  gracefulShutdown,
+  rejectNestedObjects,
+  validateMemo,
+  bootstrapServer,
+};
