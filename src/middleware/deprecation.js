@@ -81,3 +81,4 @@ function deprecation({ sunset, link } = {}) {
 module.exports = deprecation;
 module.exports.deprecation = deprecation;
 module.exports.toHttpDate = toHttpDate;
+module.exports.resolveSunset = resolveSunset;

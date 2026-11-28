@@ -18,7 +18,7 @@ fi
 
 # Ensure the stellar CLI is available
 if ! command -v stellar &> /dev/null; then
-  echo "stellar CLI not found. Install with: cargo install --locked stellar-cli" >&2
+  echo "stellar CLI not found. Install with: cargo install stellar-cli --version 21.0.0" >&2
   exit 1
 fi
 
